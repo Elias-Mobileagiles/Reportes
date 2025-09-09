@@ -1,0 +1,100 @@
+- name: Ejecutar Auditor de Seguridad de FortiGate
+  connection: local
+  hosts: fgt-BEST
+  gather_facts: yes
+  vars:
+    location: best
+
+  tasks:
+    - name: Obtener la fecha actual para el nombre del archivo y el asunto del correo
+      ansible.builtin.set_fact:
+        current_date: "{{ ansible_date_time.date }}" # Formato YYYY-MM-DD
+  
+    - name: Calcular y establecer la fecha de hace 7 días (temporal)
+      ansible.builtin.set_fact:
+        fecha_hace_7_dias_solo_dmya: "2025-06-16" # Fecha de hace 7 días desde hoy (16 de junio)
+
+    - name: Definir la ruta del archivo PDF antiguo para la comparación
+      ansible.builtin.set_fact:
+        old_pdf_path_for_comparison: "/home/adminjibarra/backups/{{ location }}/audit/Audit_{{ alias }}_{{ fecha_hace_7_dias_solo_dmya }}.pdf"
+
+    # Paso 1: Definir el patrón de búsqueda del archivo de entrada (con comodín)
+    - name: Definir el patrón de búsqueda del archivo de respaldo
+      ansible.builtin.set_fact:
+        # Asegúrate que el prefijo del archivo sea 'domsa' si es lo que usas ahora
+        backup_file_pattern_txt: "{{ alias }}_{{ current_date }}_*.txt"
+        backup_file_pattern_conf: "{{ alias }}_{{ current_date }}_*.conf"
+        backup_files_dir: "/home/adminjibarra/backups/{{ location }}/" # Directorio donde buscar
+
+    # Paso 2: Buscar el archivo de respaldo real que coincide con el patrón
+    - name: Buscar el archivo de respaldo de FortiGate (con comodín de hora y extensión .txt)
+      ansible.builtin.find:
+        paths: "{{ backup_files_dir }}"
+        patterns: "{{ backup_file_pattern_txt }}"
+      register: found_backup_files_txt
+
+    - name: Buscar el archivo de respaldo de FortiGate (con comodín de hora y extensión .conf)
+      ansible.builtin.find:
+        paths: "{{ backup_files_dir }}"
+        patterns: "{{ backup_file_pattern_conf }}"
+      register: found_backup_files_conf
+
+    # Paso 3: Validar que se encontró un único archivo y obtener su ruta exacta
+    - name: Verificar si se encontró exactamente un archivo de respaldo (ya sea .txt o .conf)
+      ansible.builtin.fail:
+        msg: "Se esperaría un solo archivo de respaldo para la fecha {{ current_date }}. Se encontraron {{ found_backup_files_txt.files | length }} .txt y {{ found_backup_files_conf.files | length }} .conf."
+      when: (found_backup_files_txt.files | length + found_backup_files_conf.files | length) != 1
+
+    - name: Establecer la ruta exacta del archivo de entrada encontrado y limpiarla manualmente
+      ansible.builtin.set_fact:
+        autofix_input_path: >-
+          {% if found_backup_files_txt.files | length == 1 %}
+            {{ found_backup_files_txt.files[0].path | string | replace('\n', '') | replace('\r', '') | trim }}
+          {% else %}
+            {{ found_backup_files_conf.files[0].path | string | replace('\n', '') | replace('\r', '') | trim }}
+          {% endif %}
+
+    # Paso 4: Definir la ruta del archivo PDF de salida
+    - name: Definir la ruta del archivo PDF de salida
+      ansible.builtin.set_fact:
+        output_pdf_path: "/home/adminjibarra/backups/{{ location }}/audit/Audit_{{ alias }}_{{ current_date }}.pdf"
+
+# Paso 5: Ejecutar fortigate-security-auditor.py con la ruta EXACTA del archivo
+    - name: Ejecutar fortigate-security-auditor.py con argumentos específicos en Linux (solución robusta)
+      ansible.builtin.shell:
+        # Añadimos un nuevo argumento --report-name y --report-date
+        cmd: "python3 \"/home/adminjibarra/fortigate-security-auditor-main/fortigate-security-auditor.py\" -q -o \"{{ output_pdf_path }}\" -l 1 2 --wan WAN1 WAN2 --autofix \"{{ autofix_input_path | trim }}\" --report-name \"{{ alias }}\" --report-date \"{{ current_date }}\""
+        chdir: "/home/adminjibarra/fortigate-security-auditor-main/"
+      register: script_output
+
+    - name: Ejecutar el script de comparación de PDF (vs. hace 7 días)
+      ansible.builtin.command:
+        cmd: "python3 \"/home/adminjibarra/fortigate-security-auditor-main/comparator.py\" \"{{ old_pdf_path_for_comparison }}\" \"{{ output_pdf_path }}\""
+        chdir: "/home/adminjibarra/fortigate-security-auditor-main/"
+      register: pdf_compare_result
+      failed_when: pdf_compare_result.rc not in [0, 2]
+      ignore_errors: true
+
+    - name: Mostrar salida del script
+      ansible.builtin.debug:
+        var: script_output.stdout_lines
+
+    - name: Enviar el informe PDF por correo electrónico
+      ansible.builtin.mail:
+        host: "email-smtp.us-east-1.amazonaws.com"
+        port: 587
+        username: "AKIAZQ3DTBGL2RHA2EEH"
+        password: "BAaWZLvynEWrmAlI6702BRQL1NN8QfxY1bQVid1PtGI6"
+        from: "backups@mobileagile.net"
+        to: "elias.leonardo@mobileagile.com.mx"
+        subject: "Informe de Auditoría FortiGate - {{ current_date }}"
+        body: |
+          Adjunto el informe de auditoría de seguridad de FortiGate generado el día de hoy.
+          ---
+          Resultados de la Comparación de PDFs:
+          {{ pdf_compare_result.stdout | default('No se pudo obtener el resultado de la comparación de PDFs.') }}
+          ---
+        attach: "{{ output_pdf_path }}"
+        secure: starttls  # Descomenta si tu servidor SMTP usa STARTTLS (común con el puerto 587)
+      when: script_output is succeeded
+
